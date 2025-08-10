@@ -2,7 +2,7 @@ from __future__ import annotations
 import os, json, time, argparse, logging
 from pathlib import Path
 import numpy as np
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from ..store.document_store import Document, DocumentStore
 from ..store.bm25_index import BM25Index
 from ..store.embedding_index import EmbeddingIndex
@@ -47,23 +47,49 @@ def build_indexes(doc_ids: List[str], texts: List[str]) -> Tuple[BM25Index, Embe
     t0 = time.time()
     cache = Path(".cache"); cache.mkdir(exist_ok=True)
     ids_p, vec_p = cache/"doc_ids.json", cache/"embeddings.npy"
-    # 캐시 로드
-    try:
-        if ids_p.exists() and vec_p.exists():
-            cached = json.loads(ids_p.read_text())
-            if cached == doc_ids:
-                bm25 = BM25Index(doc_ids, texts)
-                emb_index = EmbeddingIndex(doc_ids, np.load(vec_p))
-                LOG.info("[LOG] Indexes loaded from cache")
-                return bm25, emb_index
-    except Exception:
-        pass
-    # 새로 생성(길이 캡 + 배치)
-    capped = [(t or "")[:4000] for t in texts]
-    emb = np.array(embed_texts(capped), dtype="float32")
-    np.save(vec_p, emb); ids_p.write_text(json.dumps(doc_ids))
+
+    cached_ids: List[str] = []
+    cached_vecs: Optional[np.ndarray] = None
+    if ids_p.exists() and vec_p.exists():
+        try:
+            cached_ids = json.loads(ids_p.read_text())
+            cached_vecs = np.load(vec_p)
+        except Exception:
+            cached_ids, cached_vecs = [], None
+
+    # 완전 일치 시 바로 반환
+    if cached_ids == doc_ids and cached_vecs is not None:
+        bm25 = BM25Index(doc_ids, texts)
+        emb_index = EmbeddingIndex(doc_ids, cached_vecs)
+        LOG.info("[LOG] Indexes loaded from cache")
+        return bm25, emb_index
+
+    # 부분 캐시 활용: 기존 임베딩을 재사용하고 새 문서만 계산
+    id_to_emb = {}
+    if cached_vecs is not None and len(cached_ids) == len(cached_vecs):
+        id_to_emb = {did: emb for did, emb in zip(cached_ids, cached_vecs)}
+
+    final_embs: List[Optional[np.ndarray]] = []
+    new_docs: List[Tuple[int, str]] = []
+    for idx, (did, txt) in enumerate(zip(doc_ids, texts)):
+        emb = id_to_emb.get(did)
+        if emb is not None:
+            final_embs.append(emb)
+        else:
+            final_embs.append(None)
+            new_docs.append((idx, (txt or "")[:4000]))
+
+    if new_docs:
+        new_embs = embed_texts([t for _, t in new_docs])
+        for (pos, _), emb in zip(new_docs, new_embs):
+            final_embs[pos] = emb
+        LOG.info("[LOG] Embedded %d new docs", len(new_docs))
+
+    emb_arr = np.array(final_embs, dtype="float32")
+    np.save(vec_p, emb_arr)
+    ids_p.write_text(json.dumps(doc_ids))
     bm25 = BM25Index(doc_ids, texts)
-    emb_index = EmbeddingIndex(doc_ids, emb)
+    emb_index = EmbeddingIndex(doc_ids, emb_arr)
     LOG.info("[LOG] Indexes built in %.2fs", time.time()-t0)
     return bm25, emb_index
 
@@ -158,12 +184,15 @@ def main():
 
     store, doc_ids, texts = load_corpus(args.herb_root)
     bm25, emb_index = build_indexes(doc_ids, texts)
-    LOG.info("[LOG] Building GraphRAG...")
-    g0 = time.time()
-    graph = GraphRAG()
-    for d in store.all():
-        graph.add_document(d.doc_id, d.text or "")
-    LOG.info("[LOG] GraphRAG built in %.2fs", time.time()-g0)
+
+    graph = None
+    if args.method == "graphrag":
+        LOG.info("[LOG] Building GraphRAG...")
+        g0 = time.time()
+        graph = GraphRAG()
+        for d in store.all():
+            graph.add_document(d.doc_id, d.text or "")
+        LOG.info("[LOG] GraphRAG built in %.2fs", time.time()-g0)
 
     qpath = args.questions or os.path.join(args.herb_root, "data", "questions.jsonl")
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
