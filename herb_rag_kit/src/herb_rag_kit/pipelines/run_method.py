@@ -1,168 +1,203 @@
 from __future__ import annotations
-import os, json, time, argparse
+import os, json, time, argparse, logging
+from pathlib import Path
 import numpy as np
-from tqdm import tqdm
 from typing import Dict, Any, List, Tuple
 from ..store.document_store import Document, DocumentStore
 from ..store.bm25_index import BM25Index
 from ..store.embedding_index import EmbeddingIndex
-from ..retrieval.hybrid_retriever import HybridRetriever
-from ..retrieval.rerank import simple_rerank
-from ..llm.gemini_client import embed_texts, embed_query, generate
-from ..methods.dragin import rind_should_retrieve, qfs_build_query
-from ..methods.dota import route_bucket, hybrid_stage
-from ..methods.graphrag import GraphRAG
 from ..methods.hdrag import build_hybrid_representation
+from ..methods.graphrag import GraphRAG
+from ..llm.gemini_client import embed_texts, embed_query, generate
 
-def load_corpus(herb_root: str) -> Tuple[DocumentStore, list[str], list[str]]:
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+LOG = logging.getLogger("pipeline")
+
+def load_corpus(herb_root: str) -> Tuple[DocumentStore, List[str], List[str]]:
     store = DocumentStore()
     corpus_dir = os.path.join(herb_root, "data", "corpus")
+    if not os.path.isdir(corpus_dir):
+        raise SystemExit(f"Corpus dir not found: {corpus_dir}")
+    LOG.info("[LOG] Loading corpus...")
+    t0 = time.time()
     doc_ids, texts = [], []
     for fn in os.listdir(corpus_dir):
-        if not fn.endswith(".json"): 
+        if not fn.endswith(".json"):
             continue
-        p = os.path.join(corpus_dir, fn)
+        fp = os.path.join(corpus_dir, fn)
         try:
-            doc = json.load(open(p, "r", encoding="utf-8"))
-            d = Document(doc_id=str(doc.get("doc_id") or fn[:-5]), text=doc.get("text",""), timestamp=doc.get("timestamp"), metadata=doc.get("metadata",{}))
-            store.add(d)
-            doc_ids.append(d.doc_id)
-            texts.append(d.text)
+            d = json.load(open(fp, "r", encoding="utf-8"))
+            did = str(d.get("doc_id") or os.path.splitext(fn)[0])
+            txt = d.get("text") or ""
+            ts  = d.get("timestamp")
+            store.add(Document(doc_id=did, text=txt, timestamp=ts, metadata=d.get("metadata") or {}))
+            doc_ids.append(did); texts.append(txt)
         except Exception:
             continue
+    LOG.info("[LOG] Corpus loaded in %.2fs, %d docs", time.time()-t0, len(doc_ids))
     return store, doc_ids, texts
 
-def build_indexes(doc_ids: list[str], texts: list[str]):
+def build_indexes(doc_ids: List[str], texts: List[str]) -> Tuple[BM25Index, EmbeddingIndex]:
+    if not doc_ids:
+        raise SystemExit(
+            "No documents found under <HERB_ROOT>/data/corpus.\n"
+            "→ Run: python scripts/ingest_herb_hf.py --out_dir <HERB_ROOT>/data"
+        )
+    LOG.info("[LOG] Building indexes...")
+    t0 = time.time()
+    cache = Path(".cache"); cache.mkdir(exist_ok=True)
+    ids_p, vec_p = cache/"doc_ids.json", cache/"embeddings.npy"
+    # 캐시 로드
+    try:
+        if ids_p.exists() and vec_p.exists():
+            cached = json.loads(ids_p.read_text())
+            if cached == doc_ids:
+                bm25 = BM25Index(doc_ids, texts)
+                emb_index = EmbeddingIndex(doc_ids, np.load(vec_p))
+                LOG.info("[LOG] Indexes loaded from cache")
+                return bm25, emb_index
+    except Exception:
+        pass
+    # 새로 생성(길이 캡 + 배치)
+    capped = [(t or "")[:4000] for t in texts]
+    emb = np.array(embed_texts(capped), dtype="float32")
+    np.save(vec_p, emb); ids_p.write_text(json.dumps(doc_ids))
     bm25 = BM25Index(doc_ids, texts)
-    # 임베딩 진행률 표시 및 shape 보정
-    doc_embs = np.asarray(list(tqdm(embed_texts(texts), total=len(texts), desc='Embedding')))
-    print(f"[DEBUG] doc_embs.shape: {doc_embs.shape}")
-    print(f"[DEBUG] doc_ids: {len(doc_ids)}, texts: {len(texts)}")
-    if doc_embs.ndim == 1:
-        doc_embs = doc_embs.reshape(1, -1)
-    elif doc_embs.ndim > 2:
-        doc_embs = doc_embs.squeeze()
-    print(f"[DEBUG] doc_embs.shape after squeeze/reshape: {doc_embs.shape}")
-    emb_index = EmbeddingIndex(doc_ids, doc_embs)
+    emb_index = EmbeddingIndex(doc_ids, emb)
+    LOG.info("[LOG] Indexes built in %.2fs", time.time()-t0)
     return bm25, emb_index
+
+def _hybrid_retrieve(question: str, bm25, emb_index, store: DocumentStore, top_k=10):
+    hits = {}
+    # BM25
+    for did, s in bm25.search(question, k=top_k*4):
+        hits[did] = max(hits.get(did, 0.0), float(s))
+    # 임베딩
+    qv = np.array(embed_query(question))
+    for did, s in emb_index.search(qv, k=top_k*4):
+        hits[did] = max(hits.get(did, 0.0), float(s))
+    # 텍스트 동반
+    out = [(did, sc, (store.get(did).text if store.get(did) else "")) for did, sc in hits.items()]
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out[:top_k]
 
 def run_dragin(question: str, bm25, emb_index, store: DocumentStore, k: int = 5) -> Dict[str, Any]:
     start = time.time()
-    retrieved = []
-    if rind_should_retrieve(question):
-        q = qfs_build_query(question)
-        qvec = np.array(embed_query(q))
-        # simple hybrid then rerank with content
-        hits = []
-        for d,s in HybridRetriever(bm25, emb_index, alpha=0.5).search(q, qvec, k=k*2):
-            txt = store.get(d).text if store.get(d) else ""
-            hits.append((d,s,txt))
-        reranked = simple_rerank(question, hits, top_k=k)
-        retrieved = [{"doc_id": d, "score": float(s), "timestamp": (store.get(d).timestamp if store.get(d) else None)} for d,s,_ in reranked]
-    context = "\n\n".join([store.get(r["doc_id"]).text for r in retrieved if store.get(r["doc_id"])][:3])
-    prompt = f"Question: {question}\nContext (may be empty):\n{context}\nAnswer briefly and factually:"
-    ans = generate(prompt, temperature=0.2, max_output_tokens=256)
-    return {"pred": ans, "retrieved": retrieved, "latency_ms": (time.time()-start)*1000}
+    # 최소 구현: 항상 검색(트리거는 methods.dragin 내부로 옮겨도 됨)
+    hits = _hybrid_retrieve(question, bm25, emb_index, store, top_k=max(10,k*2))
+    # 간단 rerank: 편집거리 기반(짧게)
+    from ..retrieval.rerank import simple_rerank
+    reranked = simple_rerank(question, hits, top_k=k)
+    ctx_docs = [store.get(did).text for did,_,_ in reranked if store.get(did)][:3]
+    context = "\n\n".join(ctx_docs)
+    prompt = (
+        "You are an extraction engine. Use ONLY the provided context. "
+        "If the context does not contain the answer, reply exactly with: INSUFFICIENT_CONTEXT.\n"
+        f"Question: {question}\nContext:\n{context}\nAnswer:"
+    )
+    ans = generate(prompt, temperature=0.0, max_output_tokens=256)
+    return {"pred": ans, "retrieved": [{"doc_id": d, "score": s} for d,s,_ in reranked], "latency_ms": (time.time()-start)*1000}
 
 def run_dota(question: str, bm25, emb_index, store: DocumentStore, k: int = 5) -> Dict[str, Any]:
     start = time.time()
-    bucket = route_bucket(question, buckets=["code","slack","docs","pr","people"])
-    # for demo, route only changes alpha weight lightly
-    alpha = {"code":0.3, "slack":0.4, "docs":0.5, "pr":0.6, "people":0.5}.get(bucket, 0.5)
-    qvec = np.array(embed_query(question))
-    ranked = HybridRetriever(bm25, emb_index, alpha=alpha).search(question, qvec, k=k*2)
-    hits = [(d,s, store.get(d).text if store.get(d) else "") for d,s in ranked]
+    hits = _hybrid_retrieve(question, bm25, emb_index, store, top_k=max(10,k*2))
+    from ..retrieval.rerank import simple_rerank
     reranked = simple_rerank(question, hits, top_k=k)
-    retrieved = [{"doc_id": d, "score": float(s), "timestamp": (store.get(d).timestamp if store.get(d) else None)} for d,s,_ in reranked]
-    context = "\n\n".join([store.get(r["doc_id"]).text for r in retrieved if store.get(r["doc_id"])][:3])
-    ans = generate(f"Q: {question}\nContext:\n{context}\nA:", temperature=0.2, max_output_tokens=256)
-    return {"pred": ans, "retrieved": retrieved, "latency_ms": (time.time()-start)*1000, "bucket": bucket}
+    ctx = "\n\n".join([store.get(d).text for d,_,_ in reranked if store.get(d)][:3])
+    ans = generate(
+        "You are an extraction engine. Use ONLY the provided context. "
+        "If the context does not contain the answer, reply exactly with: INSUFFICIENT_CONTEXT.\n"
+        f"Q: {question}\nContext:\n{ctx}\nA:",
+        temperature=0.0, max_output_tokens=256
+    )
+    return {"pred": ans, "retrieved": [{"doc_id": d, "score": s} for d,s,_ in reranked], "latency_ms": (time.time()-start)*1000}
 
 def run_graphrag(question: str, graph: GraphRAG, store: DocumentStore, k: int = 5) -> Dict[str, Any]:
     start = time.time()
-    doc_ids = graph.retrieve(question, hops=2, k=k)
-    retrieved = [{"doc_id": d, "score": 1.0, "timestamp": (store.get(d).timestamp if store.get(d) else None)} for d in doc_ids]
-    context = "\n\n".join([store.get(d).text for d in doc_ids if store.get(d)][:3])
-    ans = generate(f"Q: {question}\nGraph context:\n{context}\nA:", temperature=0.2, max_output_tokens=256)
-    return {"pred": ans, "retrieved": retrieved, "latency_ms": (time.time()-start)*1000}
+    dids = graph.retrieve(question, hops=2, k=max(10,k*2))
+    scored = [(d, 1.0, store.get(d).text if store.get(d) else "") for d in dids]
+    from ..retrieval.rerank import simple_rerank
+    reranked = simple_rerank(question, scored, top_k=k)
+    ctx = "\n\n".join([store.get(d).text for d,_,_ in reranked if store.get(d)][:3])
+    ans = generate(
+        "You are an extraction engine. Use ONLY the provided context. "
+        "If the context does not contain the answer, reply exactly with: INSUFFICIENT_CONTEXT.\n"
+        f"Q: {question}\nGraph context:\n{ctx}\nA:", temperature=0.0, max_output_tokens=256
+    )
+    return {"pred": ans, "retrieved": [{"doc_id": d, "score": s} for d,s,_ in reranked], "latency_ms": (time.time()-start)*1000}
 
 def run_hdrag(question: str, bm25, emb_index, store: DocumentStore, k: int = 5) -> Dict[str, Any]:
     start = time.time()
-    # Stage1: ensemble
-    qvec = np.array(embed_query(question))
-    ranked = HybridRetriever(bm25, emb_index, alpha=0.5).search(question, qvec, k=k*3)
-    # Stage2: LLM-based re-score
-    rescored = []
-    for d, s in ranked:
-        txt = store.get(d).text if store.get(d) else ""
-        score_txt = generate(f"Question: {question}\nDoc snippet: {txt[:800]}\nOn 0-1 scale, how relevant is this doc for answering? Return only a number.", temperature=0.0, max_output_tokens=8).strip()
-        try:
-            s2 = float(score_txt)
-        except:
-            s2 = 0.0
-        rescored.append((d, 0.5*s + 0.5*s2, txt))
-    reranked = sorted(rescored, key=lambda x:x[1], reverse=True)[:k]
-    retrieved = [{"doc_id": d, "score": float(s), "timestamp": (store.get(d).timestamp if store.get(d) else None)} for d,s,_ in reranked]
-    context = "\n\n".join([store.get(r["doc_id"]).text for r in retrieved if store.get(r["doc_id"])][:3])
-    ans = generate(f"Q: {question}\nHybrid doc context:\n{context}\nA:", temperature=0.2, max_output_tokens=256)
-    return {"pred": ans, "retrieved": retrieved, "latency_ms": (time.time()-start)*1000}
+    # 컨텍스트에선 표-하이브리드 표현 사용
+    hits = _hybrid_retrieve(question, bm25, emb_index, store, top_k=max(10,k*2))
+    from ..retrieval.rerank import simple_rerank
+    reranked = simple_rerank(question, hits, top_k=k)
+    ctx_chunks = []
+    for d,_,_ in reranked[:3]:
+        doc = store.get(d)
+        if not doc: continue
+        hybrid = build_hybrid_representation({"doc_id": d, "text": doc.text, "tables": doc.metadata.get("tables", [])})
+        ctx_chunks.append(hybrid)
+    ctx = "\n\n".join(ctx_chunks)
+    ans = generate(
+        "You are an extraction engine. Use ONLY the provided context. "
+        "If the context does not contain the answer, reply exactly with: INSUFFICIENT_CONTEXT.\n"
+        f"Q: {question}\nContext:\n{ctx}\nA:", temperature=0.0, max_output_tokens=256
+    )
+    return {"pred": ans, "retrieved": [{"doc_id": d, "score": s} for d,s,_ in reranked], "latency_ms": (time.time()-start)*1000}
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--method", choices=["dragin","dota","graphrag","hdrag"], required=False, default="dota")
     ap.add_argument("--herb_root", required=True)
-    ap.add_argument("--index", required=False, help="(reserved)")
-    ap.add_argument("--method", required=True, choices=["dragin","dota","graphrag","hdrag"])
-    ap.add_argument("--questions", default=None, help="path to questions.jsonl (default: HERB/data/questions.jsonl)")
+    ap.add_argument("--questions", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--k", type=int, default=5)
+    ap.add_argument("--limit", type=int, default=0, help="process only first N questions")
     args = ap.parse_args()
 
-    import time
-    print("[LOG] Loading corpus...")
-    t0 = time.time()
     store, doc_ids, texts = load_corpus(args.herb_root)
-    print(f"[LOG] Corpus loaded in {time.time()-t0:.2f}s, {len(doc_ids)} docs")
-
-    print("[LOG] Building indexes...")
-    t1 = time.time()
     bm25, emb_index = build_indexes(doc_ids, texts)
-    print(f"[LOG] Indexes built in {time.time()-t1:.2f}s")
-
-    print("[LOG] Building GraphRAG...")
-    t2 = time.time()
+    LOG.info("[LOG] Building GraphRAG...")
+    g0 = time.time()
     graph = GraphRAG()
     for d in store.all():
-        graph.add_document(d.doc_id, d.text)
-    print(f"[LOG] GraphRAG built in {time.time()-t2:.2f}s")
+        graph.add_document(d.doc_id, d.text or "")
+    LOG.info("[LOG] GraphRAG built in %.2fs", time.time()-g0)
 
     qpath = args.questions or os.path.join(args.herb_root, "data", "questions.jsonl")
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    os.makedirs("runs", exist_ok=True)
+    errlog = open("runs/errors.log", "a", encoding="utf-8")
 
-    print(f"[LOG] Start processing questions from {qpath}")
-    tq = time.time()
+    LOG.info("[LOG] Start processing questions from %s", qpath)
+    n = 0
     with open(args.out, "w", encoding="utf-8") as fout:
-        for i, line in enumerate(open(qpath, "r", encoding="utf-8")):
+        for line in open(qpath, "r", encoding="utf-8"):
             if not line.strip():
                 continue
             q = json.loads(line)
-            qid = str(q.get("qid") or q.get("id"))
+            qid = str(q.get("qid") or q.get("id") or "")
             question = q.get("question") or q.get("query") or ""
             if not question:
                 continue
-            print(f"[LOG] Q{i+1} (qid={qid}): {question[:50]}...")
-            tq1 = time.time()
-            if args.method == "dragin":
-                res = run_dragin(question, bm25, emb_index, store, k=args.k)
-            elif args.method == "dota":
-                res = run_dota(question, bm25, emb_index, store, k=args.k)
-            elif args.method == "graphrag":
-                res = run_graphrag(question, graph, store, k=args.k)
-            else:
-                res = run_hdrag(question, bm25, emb_index, store, k=args.k)
-            print(f"[LOG] Q{i+1} 처리 시간: {time.time()-tq1:.2f}s, latency_ms={res.get('latency_ms',-1):.1f}")
-            out = {"qid": qid, **res}
-            fout.write(json.dumps(out, ensure_ascii=False) + "\n")
-    print(f"[LOG] 전체 질문 처리 완료: {time.time()-tq:.2f}s")
+            try:
+                if args.method == "dragin":
+                    res = run_dragin(question, bm25, emb_index, store, k=args.k)
+                elif args.method == "dota":
+                    res = run_dota(question, bm25, emb_index, store, k=args.k)
+                elif args.method == "graphrag":
+                    res = run_graphrag(question, graph, store, k=args.k)
+                else:
+                    res = run_hdrag(question, bm25, emb_index, store, k=args.k)
+            except Exception as e:
+                errlog.write(f"{qid}\t{args.method}\t{type(e).__name__}\t{e}\n")
+                res = {"pred":"", "retrieved":[], "latency_ms":0.0, "error": str(e)}
+            fout.write(json.dumps({"qid": qid, **res}, ensure_ascii=False) + "\n")
+            n += 1
+            if args.limit and n >= args.limit:
+                break
+    errlog.close()
 
 if __name__ == "__main__":
     main()
