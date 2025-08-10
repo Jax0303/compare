@@ -8,8 +8,8 @@
 - **GraphRAG-lite**: 엔티티 그래프 기반 멀티-홉 수집
 - **HD-RAG-lite**: 표(H-RCL 텍스트화) + 2단계 검색(LLM 재스코어)
 
-공통 LLM: **Gemini 2.5 Pro** (`GEMINI_API_KEY` 필요)  
-데이터: **HERB** (Hugging Face Hub에서 JSON 파일 직접 다운로드 → 로컬 파일 변환)
+공통 LLM: **Gemini 2.5 Pro** (`GEMINI_API_KEY` 필요)
+데이터: **HERB**
 
 ---
 
@@ -40,25 +40,30 @@ cd ~/compare/herb_rag_kit
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt datasets
 
-# 2) 패키지 경로 (src 패스 필요)
+# 2) (선택) 패키지 경로
+# `run_*.py` 스크립트는 자동으로 `src` 경로를 추가하므로 일반 실행에는 필요 없습니다.
+# 평가 스크립트 등을 직접 실행할 때만 설정하면 됩니다.
 export PYTHONPATH=$PWD/src
 
 # 3) 환경 변수(.env)
 cp .env.example .env
 # 편집기로 .env 열고 GEMINI_API_KEY=<당신의 키> 입력 (절대 커밋 금지)
 
-# 4) HERB 데이터 인제스트(처음 1회)
-mkdir -p ~/HERB_repo/data
-python scripts/ingest_herb_hf.py --out_dir ~/HERB_repo/data
-# -> ~/HERB_repo/data/{corpus/*.json, questions.jsonl, gold.jsonl}
+# 4) HERB 데이터셋 가져오기 (GitHub)
+git clone https://github.com/Jax0303/HERB.git ~/HERB_repo
 
-# 5) 방법론 실행 (예: DoTA-RAG)
-python scripts/run_dota.py --herb_root ~/HERB_repo --out runs/dota_r1.jsonl
+# 5) 인덱싱/임베딩 + 파이프라인 실행 (예: DoTA-RAG, 10개 질문만)
+python scripts/run_dota.py --herb_root ~/HERB_repo --out runs/dota_dbg.jsonl --limit 10
+# 최초 실행 시 corpus 전체에 대한 BM25/임베딩 인덱스를 생성하고 `.cache/`에 저장합니다.
+# 이후 실행부터는 캐시가 재사용되며 새 문서만 추가 임베딩합니다.
 
-# 6) 평가 (Fresh@K/TTI 포함)
+# 6) 다른 방법론 실행 (예: GraphRAG, 5개 질문)
+python scripts/run_graphrag.py --herb_root ~/HERB_repo --out runs/graphrag_dbg.jsonl --limit 5
+
+# 7) 평가 (Fresh@K/TTI 포함)
 python src/herb_rag_kit/eval/herb_eval_extras.py \
-  --pred runs/dota_r1.jsonl \
+  --pred runs/dota_dbg.jsonl \
   --gold ~/HERB_repo/data/gold.jsonl \
   --t0 2025-07-01T00:00:00Z \
   --k 1 5 10 \
-  --out runs/results_dota_r1.json
+  --out runs/results_dota_dbg.json
