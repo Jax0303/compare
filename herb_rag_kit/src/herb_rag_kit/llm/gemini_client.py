@@ -23,6 +23,15 @@ def ensure_configured():
         raise RuntimeError("GEMINI_API_KEY is not set. Put it in repo_root/.env or export it.")
     genai.configure(api_key=api_key)
 
+def _unwrap_vec(e):
+    # v0.7+ 스타일: {"embedding":{"values":[...]}}
+    if isinstance(e, dict):
+        if "embedding" in e and isinstance(e["embedding"], dict) and "values" in e["embedding"]:
+            return e["embedding"]["values"]
+        if "values" in e:
+            return e["values"]
+    return e  # 이미 list 면 그대로
+
 def embed_texts(texts: List[str]) -> List[List[float]]:
     ensure_configured()
     safe = [(t or "")[:4000] for t in texts]
@@ -31,28 +40,28 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     for i in range(0, len(safe), B):
         chunk = safe[i:i+B]
         out = genai.embed_content(model=EMBED_MODEL, content=chunk, task_type="retrieval_document")
+        batch = []
         if isinstance(out, dict) and "embeddings" in out:
-            batch = []
             for e in out["embeddings"]:
-                if isinstance(e, dict) and "values" in e:
-                    batch.append(e["values"])
-                elif isinstance(e, list):
-                    batch.append(e)
-            embs.extend(batch)
+                v = _unwrap_vec(e)
+                batch.append(v if isinstance(v, list) else [0.0]*768)
         elif isinstance(out, dict) and "embedding" in out:
-            embs.append(out["embedding"])
+            v = _unwrap_vec(out["embedding"])
+            batch = [v if isinstance(v, list) else [0.0]*768]
         else:
-            # 알 수 없는 응답은 0벡터로 대체(차원은 768로 가정)
-            embs.extend([[0.0]*768 for _ in chunk])
+            batch = [[0.0]*768 for _ in chunk]
+        embs.extend(batch)
     return embs
 
 def embed_query(text: str) -> List[float]:
     ensure_configured()
     out = genai.embed_content(model=EMBED_MODEL, content=(text or "")[:4000], task_type="retrieval_query")
     if isinstance(out, dict) and "embedding" in out:
-        return out["embedding"]
+        v = _unwrap_vec(out["embedding"])
+        return v if isinstance(v, list) else [0.0]*768
     if isinstance(out, dict) and "embeddings" in out:
-        return out["embeddings"][0]
+        v = _unwrap_vec(out["embeddings"][0])
+        return v if isinstance(v, list) else [0.0]*768
     return [0.0]*768
 
 def generate(prompt: str, temperature: float = 0.2, max_output_tokens: int = 512) -> str:
