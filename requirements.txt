@@ -1,0 +1,11 @@
+google-generativeai>=0.7.2
+rank-bm25>=0.2.2
+numpy>=1.25.0
+pandas>=2.0.0
+tqdm>=4.66.0
+python-dotenv>=1.0.1
+networkx>=3.2.1
+spacy>=3.7.5
+nltk>=3.8.1
+rapidfuzz>=3.9.6
+pyyaml>=6.0.1

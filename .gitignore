@@ -1,6 +1,2 @@
-.venv/
 .env
-runs/
-.cache/
-__pycache__/
-*.pyc
+.env
