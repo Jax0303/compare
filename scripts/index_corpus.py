@@ -1,0 +1,1 @@
+print("This kit builds BM25/embedding indexes on the fly from HERB/data/corpus. No offline step required.")
