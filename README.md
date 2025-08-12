@@ -50,6 +50,10 @@ python scripts/run_hdrag.py --herb_root /path/to/HERB --index .cache/index --out
 ## 5) 평가(Fresh@K/TTI 포함)
 ```bash
 python src/herb_rag_kit/eval/herb_eval_extras.py   --pred runs/dota_r1.jsonl runs/dota_r2.jsonl   --gold /path/to/HERB/data/gold.jsonl   --t0 2025-07-01T00:00:00Z   --k 1 5 10   --tti_metric hit@1 --tti_threshold 0.5   --out results_dota_tti.json
+
+**목표**: HERB(Heterogeneous Enterprise RAG Benchmark)로 *새 데이터 처리력*을 공정하게 비교.
+- 공통 LLM: **Gemini 2.5 Pro**
+- 공통 지표: EM, F1, Hit@K, Fresh@K(T0 이후), 지연(평균/중앙/95p), (옵션) Correctness/Faithfulness
 ```
 
 ## 구현 메모
