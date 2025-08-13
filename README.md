@@ -6,7 +6,7 @@
 
 ## 1) 설치
 ```bash
-python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python3 -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
 # .env 파일에서 GEMINI_API_KEY=... 값을 채워주세요.
