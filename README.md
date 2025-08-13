@@ -15,13 +15,9 @@ cp .env.example .env
 > 당신이 준 키는 코드에 절대 하드코딩하지 않습니다. 반드시 환경변수(`.env` 또는 시스템 환경)로만 사용합니다.
 
 ## 2) HERB 데이터 준비
-이 킷은 **로컬 HERB 복사본**을 사용합니다. 구조 예:
+
 ```
-HERB/
-  data/
-    questions.jsonl                # qid, question, type, ... (사용자 보유본)
-    corpus/
-      <doc_id>.json                # {doc_id, text, timestamp, metadata...}
+git clone https://github.com/Jax0303/HERB.git
 ```
 
 ## 3) 인덱스 생성
