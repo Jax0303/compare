@@ -66,27 +66,69 @@ def embed_query(text: str) -> List[float]:
 
 def generate(prompt: str, temperature: float = 0.2, max_output_tokens: int = 512) -> str:
     ensure_configured()
-    model = genai.GenerativeModel(MODEL_NAME)
+    # 신규 SDK에서 권장되는 Safety 설정 (필요 시 완화)
     try:
-        resp = model.generate_content(
-            prompt,
-            generation_config={"temperature": temperature, "max_output_tokens": max_output_tokens},
+        from google.generativeai.types import HarmCategory, HarmBlockThreshold, GenerationConfig
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUAL_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
+        gen_cfg = GenerationConfig(
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            candidate_count=1,
         )
     except Exception:
-        return ""
-    # 보통 케이스
+        safety_settings, gen_cfg = None, {"temperature": temperature, "max_output_tokens": max_output_tokens}
+
+    model = genai.GenerativeModel(MODEL_NAME if MODEL_NAME.startswith("models/") else f"models/{MODEL_NAME}")
+
+    def _extract_text(resp):
+        # 1순위: resp.text
+        try:
+            if getattr(resp, "text", None):
+                return resp.text.strip()
+        except Exception:
+            pass
+        # 2순위: candidates.parts[].text
+        out = []
+        for c in getattr(resp, "candidates", []) or []:
+            content = getattr(c, "content", None)
+            parts = getattr(content, "parts", []) if content is not None else []
+            for p in parts:
+                t = getattr(p, "text", None)
+                if t:
+                    out.append(t)
+        return "\n".join(out).strip()
+
     try:
-        if resp.text:
-            return resp.text
-    except Exception:
-        pass
-    # 후보 파트에서 텍스트 수집(세이프티/빈 후보 대응)
-    out_parts = []
-    for cand in getattr(resp, "candidates", []) or []:
-        content = getattr(cand, "content", None)
-        parts = getattr(content, "parts", []) if content is not None else []
-        for p in parts:
-            t = getattr(p, "text", None)
-            if t:
-                out_parts.append(t)
-    return "\n".join(out_parts).strip()
+        resp = model.generate_content(
+            contents=[{"role": "user", "parts": [{"text": (prompt or '').strip()}]}],
+            generation_config=gen_cfg,
+            safety_settings=safety_settings,
+        )
+        text = _extract_text(resp)
+        if text:
+            return text
+
+        # 텍스트가 비면 이유를 표면화
+        pf = getattr(resp, "prompt_feedback", None)
+        sr = [getattr(c, "safety_ratings", None) for c in getattr(resp, "candidates", []) or []]
+        debug = f"[empty_response] prompt_feedback={pf}, safety_ratings={sr}"
+        # 마지막 시도: flash로 폴백
+        try:
+            fallback = genai.GenerativeModel("models/gemini-2.0-flash")
+            resp2 = fallback.generate_content(
+                contents=[{"role": "user", "parts": [{"text": (prompt or '').strip()}]}],
+                generation_config=gen_cfg,
+                safety_settings=safety_settings,
+            )
+            text2 = _extract_text(resp2)
+            return text2 if text2 else debug
+        except Exception:
+            return debug
+    except Exception as e:
+        return f"[generate_error] {type(e).__name__}: {e}"
+

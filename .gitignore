@@ -7,3 +7,21 @@ indexes/
 *.patch
 __pycache__/
 *.pyc
+# secrets
+.env
+.env.*
+*.env
+
+# local env / caches
+.venv/
+
+.cache/
+*.npy
+*.pkl
+
+# run artifacts
+
+*.jsonl
+
+# OS cruft
+.DS_Store

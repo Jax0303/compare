@@ -10,6 +10,29 @@ from ..methods.hdrag import build_hybrid_representation
 from ..methods.graphrag import GraphRAG
 from ..llm.gemini_client import embed_texts, embed_query, generate
 
+def _coerce_vec(v, dim: int) -> "np.ndarray":
+    import numpy as np
+    # dict 응답이면 대표 키에서 꺼내기
+    if isinstance(v, dict):
+        for k in ("embedding","values","vector","data"):
+            if k in v:
+                v = v[k]; break
+    # 리스트/튜플/ndarray 모두 1D로 평탄화
+    v = np.asarray(v, dtype="float32")
+    if v.ndim > 1:
+        v = v.reshape(-1)
+    # 비어있거나 유한값 아님 → 0벡터
+    if v.size == 0:
+        return np.zeros(dim, dtype="float32")
+    v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+    # 길이 맞추기(>dim 자르기, <dim 0-padding)
+    if v.size != dim:
+        if v.size > dim:
+            v = v[:dim]
+        else:
+            v = np.pad(v, (0, dim - v.size))
+    return v
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 LOG = logging.getLogger("pipeline")
 
@@ -80,9 +103,30 @@ def build_indexes(doc_ids: List[str], texts: List[str]) -> Tuple[BM25Index, Embe
             new_docs.append((idx, (txt or "")[:4000]))
 
     if new_docs:
-        new_embs = embed_texts([t for _, t in new_docs])
-        for (pos, _), emb in zip(new_docs, new_embs):
+        # 1) 입력 방어: 빈 텍스트는 대체
+        payload = [(t if t and t.strip() else "[EMPTY]") for _, t in new_docs]
+
+        # 2) 임베딩 호출
+        raw = embed_texts(payload)
+
+        # 3) 차원 추정: 첫 유효 벡터 길이, 실패 시 768(gemini text-embedding-004)
+        def _len1(v):
+            if isinstance(v, dict):
+                for k in ("embedding","values","vector","data"):
+                    if k in v: v=v[k]; break
+            try:
+                import numpy as np
+                a = np.asarray(v)
+                return (a.reshape(-1)).size
+            except Exception:
+                return 0
+        dim = next(( _len1(v) for v in raw if _len1(v)>0 ), 768)
+
+        # 4) 정규화해서 final_embs에 정확히 (dim,)로 채우기
+        fixed = [ _coerce_vec(v, dim) for v in raw ]
+        for (pos, _), emb in zip(new_docs, fixed):
             final_embs[pos] = emb
+
         LOG.info("[LOG] Embedded %d new docs", len(new_docs))
 
     emb_arr = np.array(final_embs, dtype="float32")
