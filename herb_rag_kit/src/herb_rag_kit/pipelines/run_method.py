@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, json, time, argparse, logging
-from pathlib import Path
+import networkx as nx
 import numpy as np
 from typing import Dict, Any, List, Tuple, Optional
 from ..store.document_store import Document, DocumentStore
@@ -271,6 +271,16 @@ def main():
             if args.limit and n >= args.limit:
                 break
     errlog.close()
+
+     # === 그래프 내보내기: graphrag일 때만, 그래프가 있을 때만 ===
+    if args.method == "graphrag" and graph is not None:
+        try:
+            os.makedirs("runs", exist_ok=True)
+            out_g = f"runs/graphrag_full_{int(time.time())}.gexf"
+            nx.write_gexf(graph.G, out_g)
+            LOG.info("[LOG] Saved GraphRAG GEXF -> %s", out_g)
+        except Exception as e:
+            LOG.warning("[LOG] Failed to save GEXF: %s", e)
 
 if __name__ == "__main__":
     main()
