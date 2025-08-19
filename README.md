@@ -62,4 +62,49 @@ python src/herb_rag_kit/eval/herb_eval_extras.py   --pred runs/dota_r1.jsonl run
 - **GraphRAG-lite**: spaCy NER → entity graph(networkx), 질문 엔티티 확장 멀티‑홉 서브그래프 수집.
 - **HD‑RAG-lite**: H‑RCL 표요약(행/열/경로) 텍스트화 → 앙상블 검색(BM25+임베딩) → LLM 기반 re‑score.
 
-각 모듈은 엄격한 타입힌트/예외 처리/로깅을 포함합니다.
+## Graph Visualization (PyVis, community meta-graph)
+
+This repo includes an end-to-end inline visualization for knowledge graphs.
+
+### Requirements
+```bash
+pip install -U pyvis jinja2 python-louvain scikit-learn
+
+Generate visualizations
+python scripts/viz_inline.py
+
+
+Artifacts:
+
+runs/graphrag_viz_inline.html — filtered main graph (backbone + k-core + ForceAtlas2)
+
+runs/community_graph.html — community meta-graph (cluster-level map)
+
+runs/graphrag_filtered.gexf — filtered graph for Gephi
+
+Open in VS Code via Live Preview / Live Server or:
+
+python -m http.server -d runs 8899
+# then open http://localhost:8899/graphrag_viz_inline.html
+
+Tuning knobs (inside scripts/viz_inline.py)
+
+TOPK_HUBS (default 100): number of hub anchors (higher → larger graph)
+
+RADIUS (default 1): r-hop neighbors from hubs (2 increases density a lot)
+
+BACKBONE_TOPK (default 3): keep top-k weighted edges per node
+
+KCORE_K (default 2): k-core filter (0 to skip)
+
+TARGET_MAX_NODES (default 700): soft cap with auto degree trim
+
+LABEL_MIN_DEG, LABEL_TOP: label density control
+
+Meta-graph cleanup: COMM_EDGE_W_MIN, TOPM_COMM_EDGES
+
+Notes
+
+Outputs in runs/ are ignored by git via .gitignore.
+
+To re-generate from a different GEXF, change GEXF_IN in scripts/viz_inline.py.
