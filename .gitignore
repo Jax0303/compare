@@ -24,4 +24,20 @@ __pycache__/
 *.jsonl
 
 # OS cruft
-.DS_Store
+.DS_Store# local env / cache / build
+.venv/
+__pycache__/
+.cache/
+*.pyc
+
+# secrets
+.env
+
+# visualization outputs
+runs/*.html
+runs/*.png
+runs/*.gexf
+runs/*.csv
+
+# (선택) 임시 인덱스/산출물
+# indexes/**
