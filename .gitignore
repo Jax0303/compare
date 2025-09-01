@@ -41,3 +41,14 @@ runs/*.csv
 
 # (선택) 임시 인덱스/산출물
 # indexes/**
+# python packaging
+*.egg-info/
+build/
+dist/
+
+# local libs
+herb_rag_kit/lib/
+
+# backups
+herb_rag_kit/HERB.bak.*/
+herb_rag_kit/requirements.txt
