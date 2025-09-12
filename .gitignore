@@ -5,3 +5,5 @@ runs/
 *.gexf
 *.html
 herb_rag_kit/src/herb_rag_kit/store/*.txt
+
+__pycache__/
