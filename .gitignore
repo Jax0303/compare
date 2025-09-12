@@ -1,54 +1,7 @@
 .venv/
 .vscode/
-HERB/
-data/
-runs/
 indexes/
-*.patch
-__pycache__/
-*.pyc
-# secrets
-.env
-.env.*
-*.env
-
-# local env / caches
-.venv/
-
-.cache/
-*.npy
-*.pkl
-
-# run artifacts
-
-*.jsonl
-
-# OS cruft
-.DS_Store# local env / cache / build
-.venv/
-__pycache__/
-.cache/
-*.pyc
-
-# secrets
-.env
-
-# visualization outputs
-runs/*.html
-runs/*.png
-runs/*.gexf
-runs/*.csv
-
-# (선택) 임시 인덱스/산출물
-# indexes/**
-# python packaging
-*.egg-info/
-build/
-dist/
-
-# local libs
-herb_rag_kit/lib/
-
-# backups
-herb_rag_kit/HERB.bak.*/
-herb_rag_kit/requirements.txt
+runs/
+*.gexf
+*.html
+herb_rag_kit/src/herb_rag_kit/store/*.txt
