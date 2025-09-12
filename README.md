@@ -14,13 +14,47 @@ cp .env.example .env
 
 > 당신이 준 키는 코드에 절대 하드코딩하지 않습니다. 반드시 환경변수(`.env` 또는 시스템 환경)로만 사용합니다.
 
-## 2) HERB 데이터 준비
+## 2) Quickstart — TXT 코퍼스 → GraphRAG 파이프라인
 
-```
-git clone https://github.com/Jax0303/HERB.git
+```bash
+# 0) 가상환경
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 1) TXT → docstore (id,text,title)
+python herb_rag_kit/scripts/convert_txt_to_docstore.py \
+  --store herb_rag_kit/src/herb_rag_kit/store \
+  --out indexes/txt/docstore.jsonl --include-all
+
+# 2) Neo4j 실행(로컬 도커)
+export NEO4J_PASSWORD='Neo4j-1717!'
+docker start neo4j-herb || docker run -d --name neo4j-herb \
+  -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH="neo4j/${NEO4J_PASSWORD}" neo4j:5
+until (echo > /dev/tcp/127.0.0.1/7687) >/dev/null 2>&1; do sleep 1; done
+docker exec -it neo4j-herb cypher-shell -u neo4j -p "$NEO4J_PASSWORD" 'RETURN 1;'
+
+# 3) 환경변수(LLM/Neo4j)
+export GEMINI_API_KEY=YOUR_KEY
+export NEO4J_URI=bolt://localhost:7687
+export NEO4J_USER=neo4j
+export NEO4J_PASSWORD="$NEO4J_PASSWORD"
+
+# 4) 추출→정제→일관성→바이어스완화→Neo4j 적재
+python herb_rag_kit/scripts/lg_pipeline.py extract \
+  --docstore indexes/txt/docstore.jsonl \
+  --conf-threshold 0.6 --consistency-llm \
+  --max-objects-per-sp 5 --max-per-entity 200
+
+# 5) 품질지표
+python herb_rag_kit/scripts/kg_quality_eval.py
+
+# 6) 서브그래프 HTML 시각화
+python herb_rag_kit/scripts/neo4j_export_viz.py \
+  --cypher "MATCH (e1:Entity)-[r:RELATES]->(e2:Entity) RETURN e1,r,e2 LIMIT 300" \
+  --out runs/kg_subgraph.html
 ```
 
-## 3) 인덱스 생성
+## 3) (선택) HERB 데이터 준비/인덱스
 ```bash
 python scripts/index_corpus.py --herb_root /path/to/HERB --out_dir .cache/index
 ```
@@ -60,7 +94,7 @@ python src/herb_rag_kit/eval/herb_eval_extras.py   --pred runs/dota_r1.jsonl run
 
 ## Graph Visualization (PyVis, community meta-graph)
 
-This repo includes an end-to-end inline visualization for knowledge graphs.
+This repo includes inline visualization utilities and Neo4j subgraph HTML export.
 
 ### Requirements
 ```bash
@@ -101,6 +135,9 @@ Meta-graph cleanup: COMM_EDGE_W_MIN, TOPM_COMM_EDGES
 
 Notes
 
-Outputs in runs/ are ignored by git via .gitignore.
+Outputs in runs/ are ignored by git via .gitignore. For Neo4j subgraph export:
+```bash
+python herb_rag_kit/scripts/neo4j_export_viz.py --out runs/kg_subgraph.html
+```
 
 To re-generate from a different GEXF, change GEXF_IN in scripts/viz_inline.py.

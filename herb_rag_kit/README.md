@@ -14,14 +14,34 @@ cp .env.example .env
 
 > 당신이 준 키는 코드에 절대 하드코딩하지 않습니다. 반드시 환경변수(`.env` 또는 시스템 환경)로만 사용합니다.
 
-## 2) HERB 데이터 준비
-이 킷은 **로컬 HERB 복사본**을 사용합니다. 구조 예:
-```
-HERB/
-  data/
-    questions.jsonl                # qid, question, type, ... (사용자 보유본)
-    corpus/
-      <doc_id>.json                # {doc_id, text, timestamp, metadata...}
+## 2) Quickstart — TXT 코퍼스 → GraphRAG 파이프라인
+```bash
+# TXT → docstore
+python scripts/convert_txt_to_docstore.py \
+  --store src/herb_rag_kit/store \
+  --out indexes/txt/docstore.jsonl --include-all
+
+# Neo4j 도커 실행
+export NEO4J_PASSWORD='Neo4j-1717!'
+docker start neo4j-herb || docker run -d --name neo4j-herb \
+  -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH="neo4j/${NEO4J_PASSWORD}" neo4j:5
+until (echo > /dev/tcp/127.0.0.1/7687) >/dev/null 2>&1; do sleep 1; done
+
+# 환경변수
+export GEMINI_API_KEY=YOUR_KEY
+export NEO4J_URI=bolt://localhost:7687
+export NEO4J_USER=neo4j
+export NEO4J_PASSWORD="$NEO4J_PASSWORD"
+
+# 추출→정제→일관성→바이어스완화→Neo4j 적재
+python scripts/lg_pipeline.py extract \
+  --docstore indexes/txt/docstore.jsonl \
+  --conf-threshold 0.6 --consistency-llm \
+  --max-objects-per-sp 5 --max-per-entity 200
+
+# 품질지표 / 시각화
+python scripts/kg_quality_eval.py
+python scripts/neo4j_export_viz.py --out runs/kg_subgraph.html
 ```
 
 ## 3) 인덱스 생성

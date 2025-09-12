@@ -8,6 +8,7 @@ sys.path.insert(0, SRC)
 import os, re, json, time, argparse
 from typing import TypedDict, Literal, List, Dict, Any, Optional
 from dataclasses import dataclass
+from collections import Counter, defaultdict
 from tqdm import tqdm
 
 # LangGraph
@@ -22,7 +23,6 @@ import google.generativeai as genai
 # 임베딩 폴백
 from sentence_transformers import SentenceTransformer
 import math
-fv
 # ----------------------- 설정 -----------------------
 
 @dataclass
@@ -33,6 +33,11 @@ class Config:
     chunk_overlap: int = int(os.getenv("LG_CHUNK_OVERLAP", "120"))
     max_chunks_per_doc: int = int(os.getenv("LG_MAX_CHUNKS", "8"))
     redact: bool = os.getenv("LG_REDACT", "1") not in ("0", "false", "False")
+    # Cleaning / consistency / bias mitigation
+    conf_threshold: float = float(os.getenv("LG_CONF_THRESHOLD", "0.6"))
+    enable_consistency: bool = os.getenv("LG_CONSISTENCY", "0") in ("1","true","True")
+    max_objects_per_sp: int = int(os.getenv("LG_MAX_OBJECTS_PER_SP", "5"))
+    max_per_entity: int = int(os.getenv("LG_MAX_PER_ENTITY", "200"))
 
 cfg = Config()
 
@@ -261,6 +266,116 @@ def llm_extract(state: State) -> State:
     state["extracted"] = len(triples_all)
     return state
 
+def _canon_text(x: str) -> str:
+    x = (x or "").strip()
+    # collapse spaces
+    x = re.sub(r"\s+", " ", x)
+    return x
+
+def _canon_pred(p: str) -> str:
+    p = (p or "").strip()
+    p = p.replace(" ", "_").replace("-", "_")
+    p = re.sub(r"[^a-zA-Z0-9_]+", "", p)
+    return p.lower()
+
+def normalize_triples(state: State) -> State:
+    rows = state.get("triples", [])
+    out = []
+    seen = set()
+    removed_lowconf = 0
+    removed_long = 0
+    for t in rows:
+        s = _canon_text(t.get("s",""))
+        o = _canon_text(t.get("o",""))
+        p = _canon_pred(t.get("p",""))
+        s_type = (t.get("s_type") or "THING").strip().upper()
+        o_type = (t.get("o_type") or "THING").strip().upper()
+        conf = float(t.get("conf", 0.7)) if str(t.get("conf",""))!="" else 0.7
+
+        if conf < cfg.conf_threshold:
+            removed_lowconf += 1
+            continue
+        # Guard absurd string length to reduce noise
+        if len(s) > 300 or len(o) > 300:
+            removed_long += 1
+            continue
+
+        rec = {
+            "s": s, "o": o, "p": p,
+            "s_type": s_type, "o_type": o_type,
+            "s_key": f"{s}|{s_type}",
+            "o_key": f"{o}|{o_type}",
+            "doc_id": (t.get("doc_id") or ""),
+            "conf": conf,
+        }
+        key = (rec["s_key"], rec["p"], rec["o_key"], rec["doc_id"]) 
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(rec)
+
+    st = state.get("stats", {})
+    st["normalize_in"] = len(rows)
+    st["normalize_out"] = len(out)
+    st["removed_lowconf"] = removed_lowconf
+    st["removed_long"] = removed_long
+    state["stats"] = st
+    state["triples"] = out
+    state["extracted"] = len(out)
+    return state
+
+def consistency_filter(state: State) -> State:
+    if not cfg.enable_consistency:
+        return state
+    rows = state.get("triples", [])
+    by_sp: dict[tuple, list] = defaultdict(list)
+    for t in rows:
+        by_sp[(t["s_key"], t["p"])].append(t)
+    kept = []
+    removed = 0
+    for (sk, p), group in by_sp.items():
+        # Prefer top objects by (count, avg_conf)
+        o_counts = Counter([t["o_key"] for t in group])
+        # rank objects
+        o_to_conf = defaultdict(list)
+        for t in group:
+            o_to_conf[t["o_key"]].append(float(t.get("conf", 0.7)))
+        ranked = sorted(o_counts.items(), key=lambda kv: (kv[1], sum(o_to_conf[kv[0]])/len(o_to_conf[kv[0]])), reverse=True)
+        allowed = set([o for o,_ in ranked[:max(1, cfg.max_objects_per_sp)]])
+        for t in group:
+            if t["o_key"] in allowed:
+                kept.append(t)
+            else:
+                removed += 1
+    st = state.get("stats", {})
+    st["consistency_removed"] = removed
+    state["stats"] = st
+    state["triples"] = kept
+    state["extracted"] = len(kept)
+    return state
+
+def bias_mitigate(state: State) -> State:
+    rows = state.get("triples", [])
+    # Cap per-entity outgoing edges to reduce hub dominance
+    by_entity: dict[str, list] = defaultdict(list)
+    for t in rows:
+        by_entity[t["s_key"]].append(t)
+    capped = []
+    dropped = 0
+    for sk, group in by_entity.items():
+        # sort by (confidence desc, rare predicate first to increase diversity)
+        pred_counts = Counter([t["p"] for t in group])
+        group_sorted = sorted(group, key=lambda t: (float(t.get("conf",0.7)), -pred_counts[t["p"]]), reverse=True)
+        keep_n = min(len(group_sorted), max(0, cfg.max_per_entity))
+        capped.extend(group_sorted[:keep_n])
+        dropped += max(0, len(group_sorted) - keep_n)
+    st = state.get("stats", {})
+    st["bias_dropped"] = dropped
+    state["stats"] = st
+    state["triples"] = capped
+    state["extracted"] = len(capped)
+    return state
+
 def ingest_triples(state: State) -> State:
     rows = state.get("triples", [])
     if rows:
@@ -297,6 +412,9 @@ g = StateGraph(State)
 g.add_node("ensure_schema", ensure_schema)
 g.add_node("redact_and_chunk", redact_and_chunk)
 g.add_node("llm_extract", llm_extract)
+g.add_node("normalize_triples", normalize_triples)
+g.add_node("consistency_filter", consistency_filter)
+g.add_node("bias_mitigate", bias_mitigate)
 g.add_node("ingest_triples", ingest_triples)
 
 g.add_node("t2c", t2c)
@@ -312,7 +430,10 @@ g.add_conditional_edges(START, route, {
 # extract branch
 g.add_edge("ensure_schema", "redact_and_chunk")
 g.add_edge("redact_and_chunk", "llm_extract")
-g.add_edge("llm_extract", "ingest_triples")
+g.add_edge("llm_extract", "normalize_triples")
+g.add_edge("normalize_triples", "consistency_filter")
+g.add_edge("consistency_filter", "bias_mitigate")
+g.add_edge("bias_mitigate", "ingest_triples")
 g.add_edge("ingest_triples", END)
 
 # query branch
@@ -338,10 +459,14 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    ex = sub.add_parser("extract", help="LLM 추출→Neo4j 적재")
+    ex = sub.add_parser("extract", help="LLM 추출→클린/일관성/바이어스완화→Neo4j")
     ex.add_argument("--docstore", default="./indexes/herb/docstore.jsonl")
     ex.add_argument("--limit", type=int, default=0, help="문서 수 제한(0=전체)")
     ex.add_argument("--max-chunks", type=int, default=cfg.max_chunks_per_doc)
+    ex.add_argument("--conf-threshold", type=float, default=cfg.conf_threshold)
+    ex.add_argument("--consistency-llm", action="store_true", help="(옵션) 일관성 필터 활성화")
+    ex.add_argument("--max-objects-per-sp", type=int, default=cfg.max_objects_per_sp)
+    ex.add_argument("--max-per-entity", type=int, default=cfg.max_per_entity)
 
     qy = sub.add_parser("query", help="GraphRAG 질의(하이브리드)")
     qy.add_argument("--q", required=True)
@@ -350,6 +475,12 @@ def main():
     args = ap.parse_args()
 
     if args.cmd == "extract":
+        # override runtime config
+        cfg.max_chunks_per_doc = int(args.max_chunks)
+        cfg.conf_threshold = float(args.conf_threshold)
+        cfg.enable_consistency = bool(args.consistency_llm)
+        cfg.max_objects_per_sp = int(args.max_objects_per_sp)
+        cfg.max_per_entity = int(args.max_per_entity)
         total = 0
         for doc in tqdm(load_docstore(args.docstore, args.limit), desc="extract+ingest"):
             # per-doc 실행 (청크는 노드 내부에서 처리)
