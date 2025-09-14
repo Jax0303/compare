@@ -54,7 +54,15 @@ def main() -> None:
                      label=f"{pred} ({conf:.2f})")
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    net.show(args.out)
+    try:
+        # 일부 환경에서 net.show()가 템플릿 문제로 실패할 수 있어 write_html로 대체
+        net.write_html(args.out, notebook=False)
+    except Exception:
+        # 구버전 호환
+        try:
+            net.save_graph(args.out)
+        except Exception as e:
+            raise SystemExit(f"Failed to write html: {e}")
     print(f"Saved: {args.out}")
 
 

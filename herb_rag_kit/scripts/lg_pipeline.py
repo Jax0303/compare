@@ -77,7 +77,7 @@ def chunk_text(text: str, chunk_chars: int, overlap: int) -> List[str]:
 
 PROMPT_TRIPLES = """You are an information extraction model.
 Extract factual SPO triples explicitly stated in the text.
-Focus on business/organization facts only (people, orgs, roles, products, dates, locations).
+Include any domain (e.g., science, legal, general knowledge) as long as facts are explicit.
 Skip any sensitive/sexual/off-topic content if present.
 Predicates must be lower_snake_case (e.g., works_at, founded_by, located_in, reports_to, partners_with, acquired, uses, builds, mentions).
 Return ONLY JSON of this schema:
@@ -142,6 +142,36 @@ def text2cypher_with_gemini(question: str) -> str:
     except Exception:
         return "MATCH (d:Document) RETURN d.id AS id, d.title AS title LIMIT 5"
 
+def cypher_candidates_with_gemini(question: str, num_candidates: int = 3) -> List[str]:
+    """Return multiple read-only Cypher candidates in JSON list ["MATCH ...", ...]."""
+    system = (
+        "You are a Cypher assistant. Return JSON array of read-only Cypher queries using MATCH/RETURN only.\n"
+        "Do NOT use CREATE/MERGE/SET/DELETE.\n"
+        "Schema: (Entity {name,type,embedding})-[:RELATES {predicate,confidence}]->(Entity); (Entity)-[:APPEARS_IN]->(Document)."
+    )
+    prompt = (
+        f"{system}\n\nQ: {question}\n"
+        f"Return JSON like [\"MATCH ...\", \"MATCH ...\"], length={num_candidates}."
+    )
+    try:
+        m = genai.GenerativeModel(model_name=cfg.gemini_model, generation_config={
+            "temperature": 0.2, "max_output_tokens": 512, "response_mime_type": "application/json"
+        })
+        resp = m.generate_content(prompt)
+        out = extract_text_from_response(resp).strip()
+        data = json.loads(out)
+        cands = [str(x).strip().strip('`') for x in data if isinstance(x, (str,))]
+        cands = [c.split("\n",1)[-1] if c.lower().startswith("cypher") else c for c in cands]
+        cands = [c for c in cands if c.lower().startswith("match")] or [text2cypher_with_gemini(question)]
+        # unique and cap
+        seen, uniq = set(), []
+        for c in cands:
+            if c not in seen:
+                seen.add(c); uniq.append(c)
+        return uniq[:max(1, num_candidates)]
+    except Exception:
+        return [text2cypher_with_gemini(question)]
+
 def try_gemini_embed(q: str, dim: int) -> Optional[List[float]]:
     # 사용자가 herb_rag_kit.llm.gemini_client.embed_query 를 갖고 있으면 우선 사용
     try:
@@ -187,9 +217,14 @@ class State(TypedDict, total=False):
     # 질의 경로
     question: str
     cypher: str
+    cypher_candidates: List[str]
+    candidate_scores: List[float]
     graph_rows: List[Dict[str,Any]]
     hybrid_rows: List[Dict[str,Any]]
     k: int
+    reranked_rows: List[Dict[str,Any]]
+    answer: str
+    consistent: bool
 
 store = Neo4jStore()
 
@@ -292,6 +327,9 @@ def normalize_triples(state: State) -> State:
         o_type = (t.get("o_type") or "THING").strip().upper()
         conf = float(t.get("conf", 0.7)) if str(t.get("conf",""))!="" else 0.7
 
+        # Skip empty strings after canonicalization
+        if not (s and p and o):
+            continue
         if conf < cfg.conf_threshold:
             removed_lowconf += 1
             continue
@@ -396,6 +434,36 @@ def run_cypher(state: State) -> State:
     state["graph_rows"] = rows
     return state
 
+def t2c_multi(state: State) -> State:
+    qs = state["question"]
+    cands = cypher_candidates_with_gemini(qs, num_candidates=3)
+    state["cypher_candidates"] = cands
+    # keep first as default
+    state["cypher"] = cands[0] if cands else text2cypher_with_gemini(qs)
+    return state
+
+def run_cypher_multi(state: State) -> State:
+    cands: List[str] = state.get("cypher_candidates", []) or [state.get("cypher","MATCH (n) RETURN n LIMIT 5")]
+    best_rows: List[Dict[str,Any]] = []
+    best_idx = 0
+    scores: List[float] = []
+    for i, cy in enumerate(cands):
+        try:
+            rows = store.run_cypher(cy)
+        except Exception:
+            rows = []
+        # simple score: number of rows
+        score = float(len(rows))
+        scores.append(score)
+        if score > float(len(best_rows)):
+            best_rows = rows
+            best_idx = i
+    state["candidate_scores"] = scores
+    if cands:
+        state["cypher"] = cands[best_idx]
+    state["graph_rows"] = best_rows
+    return state
+
 def run_knn(state: State) -> State:
     k = int(state.get("k", 5))
     qvec = get_query_vec(state["question"], store.cfg.emb_dim)
@@ -404,6 +472,61 @@ def run_knn(state: State) -> State:
         return state
     hyb = store.knn(qvec, k=k)
     state["hybrid_rows"] = hyb
+    return state
+
+def rerank_results(state: State) -> State:
+    """Heuristic re-ranker combining graph_rows and hybrid_rows."""
+    g = state.get("graph_rows", [])
+    h = state.get("hybrid_rows", [])
+    combined: List[Dict[str,Any]] = []
+    # tag and simple score
+    for r in g:
+        r2 = dict(r)
+        r2["_source"] = "graph"
+        r2["_score"] = 1.0
+        combined.append(r2)
+    for r in h:
+        r2 = dict(r)
+        r2["_source"] = "knn"
+        r2["_score"] = float(r.get("score", 0.0))
+        combined.append(r2)
+    # sort by score desc, keep top k
+    combined.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+    state["reranked_rows"] = combined[: int(state.get("k", 5))]
+    return state
+
+def generate_answer_with_evidence(state: State) -> State:
+    """Generate short answer anchored to evidence rows."""
+    evid = state.get("reranked_rows", []) or state.get("graph_rows", [])
+    # Build concise evidence text
+    snippets = []
+    for i, r in enumerate(evid[:5], 1):
+        # try best-effort formatting
+        s = r.get("s") or r.get("e1") or r.get("id") or r.get("title")
+        o = r.get("o") or r.get("e2")
+        p = r.get("p") or r.get("predicate") or "relates"
+        snippets.append(f"[{i}] {s} -{p}-> {o}")
+    ev_text = "\n".join(snippets) if snippets else "(no strong evidence)"
+    q = state.get("question", "")
+    prompt = (
+        "Answer the question concisely using ONLY the evidence below.\n"
+        "If evidence is insufficient, say 'insufficient evidence'.\n"
+        "Cite evidence indices like [1], [2].\n\n"
+        f"Question: {q}\n"
+        f"Evidence:\n{ev_text}\n"
+    )
+    try:
+        m = genai.GenerativeModel(model_name=cfg.gemini_model, generation_config={"temperature":0.0, "max_output_tokens":256})
+        resp = m.generate_content(prompt)
+        ans = extract_text_from_response(resp).strip()
+    except Exception:
+        ans = "insufficient evidence"
+    state["answer"] = ans
+    return state
+
+def consistency_check(state: State) -> State:
+    """Lightweight consistency: answer considered consistent if we had any evidence rows."""
+    state["consistent"] = bool(state.get("reranked_rows") or state.get("graph_rows"))
     return state
 
 # ----------------------- 그래프 구성 -----------------------
@@ -419,7 +542,12 @@ g.add_node("ingest_triples", ingest_triples)
 
 g.add_node("t2c", t2c)
 g.add_node("run_cypher", run_cypher)
+g.add_node("t2c_multi", t2c_multi)
+g.add_node("run_cypher_multi", run_cypher_multi)
 g.add_node("run_knn", run_knn)
+g.add_node("rerank_results", rerank_results)
+g.add_node("generate_answer_with_evidence", generate_answer_with_evidence)
+g.add_node("consistency_check", consistency_check)
 
 # 라우팅
 g.add_conditional_edges(START, route, {
@@ -437,9 +565,12 @@ g.add_edge("bias_mitigate", "ingest_triples")
 g.add_edge("ingest_triples", END)
 
 # query branch
-g.add_edge("t2c", "run_cypher")
-g.add_edge("run_cypher", "run_knn")
-g.add_edge("run_knn", END)
+g.add_edge("t2c_multi", "run_cypher_multi")
+g.add_edge("run_cypher_multi", "run_knn")
+g.add_edge("run_knn", "rerank_results")
+g.add_edge("rerank_results", "generate_answer_with_evidence")
+g.add_edge("generate_answer_with_evidence", "consistency_check")
+g.add_edge("consistency_check", END)
 
 app = g.compile()
 
@@ -503,8 +634,13 @@ def main():
         out = {
             "question": args.q,
             "cypher": st.get("cypher"),
+            "cypher_candidates": st.get("cypher_candidates", []),
+            "candidate_scores": st.get("candidate_scores", []),
             "graph_rows": st.get("graph_rows", [])[:args.k],
             "hybrid_rows": st.get("hybrid_rows", []),
+            "reranked_rows": st.get("reranked_rows", []),
+            "answer": st.get("answer", ""),
+            "consistent": bool(st.get("consistent", False)),
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))
 
