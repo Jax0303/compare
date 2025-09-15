@@ -56,24 +56,32 @@ def call_gemini(model_name: str, text: str, retries: int = 3, sleep_s: float = 1
     last_err = None
     for t in range(retries):
         try:
-            m = genai.GenerativeModel(
+            # google-generativeai 최신 타입으로 안전성 설정
+            try:
+                from google.generativeai.types import HarmCategory, HarmBlockThreshold
+                safety = [
+                    {"category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, "threshold": HarmBlockThreshold.BLOCK_NONE},
+                    {"category": HarmCategory.HARM_CATEGORY_HATE_SPEECH, "threshold": HarmBlockThreshold.BLOCK_NONE},
+                    {"category": HarmCategory.HARM_CATEGORY_HARASSMENT, "threshold": HarmBlockThreshold.BLOCK_NONE},
+                    {"category": HarmCategory.HARM_CATEGORY_SEXUAL_CONTENT, "threshold": HarmBlockThreshold.BLOCK_NONE},
+                ]
+            except Exception:
+                safety = None
+
+            # 1차 시도: JSON MIME 강제
+            m1 = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config={
                     "temperature": 0.0,
                     "max_output_tokens": 2048,
                     "response_mime_type": "application/json"
                 },
-                safety_settings=[  # 널널하게
-                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_SEXUAL_CONTENT", "threshold": "BLOCK_NONE"},
-                ],
+                safety_settings=safety,
             )
-            resp = m.generate_content(PROMPT.format(text=text))
+            resp = m1.generate_content(PROMPT.format(text=text))
             out = extract_text_from_response(resp).strip()
             if not out:
-                if verbose: print("[WARN] empty response; retrying…")
+                if verbose: print("[WARN] empty response; falling back to text mode…")
                 raise RuntimeError("empty_response")
 
             # JSON robust parsing
@@ -86,6 +94,32 @@ def call_gemini(model_name: str, text: str, retries: int = 3, sleep_s: float = 1
                     triples = json.loads(out[l:r+1])
             if not isinstance(triples, list):
                 triples = []
+
+            # 2차 시도: 텍스트 모드로 재시도 (비JSON 응답 보완)
+            if not triples:
+                if verbose: print("[WARN] empty/invalid JSON, retrying with plain text…")
+                m2 = genai.GenerativeModel(
+                    model_name=model_name,
+                    generation_config={
+                        "temperature": 0.0,
+                        "max_output_tokens": 2048,
+                    },
+                    safety_settings=safety,
+                )
+                resp2 = m2.generate_content(PROMPT.format(text=text))
+                out2 = extract_text_from_response(resp2).strip()
+                if out2:
+                    try:
+                        triples = json.loads(out2)
+                    except Exception:
+                        l, r = out2.find("["), out2.rfind("]")
+                        if l != -1 and r != -1:
+                            try:
+                                triples = json.loads(out2[l:r+1])
+                            except Exception:
+                                triples = []
+                if not isinstance(triples, list):
+                    triples = []
 
             clean = []
             for it in triples:

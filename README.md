@@ -76,6 +76,21 @@ python scripts/kg_quality_eval.py
 python scripts/neo4j_export_viz.py --out runs/kg_subgraph.html
 ```
 
+## 6-1) Document 전량 업서트(선택)
+LLM 추출 없이도 문서 노드를 만들고 벡터 인덱스를 활용하려면 `indexes/txt/*.jsonl`을 Neo4j `Document`로 업서트하세요.
+
+```bash
+# (예시) 임베딩 포함 업서트 스크립트 실행
+PYTHONPATH=herb_rag_kit/src \
+  .venv/bin/python scripts/upsert_documents.py | tee runs/upsert_docs_full.log
+
+# 검증
+docker exec -i neo4j-herb cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
+  "MATCH (d:Document) RETURN count(d) AS docs"
+```
+
+참고: 최초 컨테이너 생성 시 설정된 비밀번호와 `.env`의 `NEO4J_PASSWORD`가 항상 일치해야 합니다. 비밀번호를 바꿀 땐 컨테이너를 삭제 후 재생성하세요.
+
 ## 7) FB15k‑237 전량 적재 및 활용(권장 경로)
 - 데이터: 엔티티 14,541 · 관계 237 · 트리플 310,116 (train 272,115 / valid 17,535 / test 20,466)
 - 이미 `herb_rag_kit/src/herb_rag_kit/store/{train,valid,test}.txt`에 포함되어 있으며, 다음으로 전량 적재/평가합니다.
@@ -96,6 +111,32 @@ make eval
 make viz
 make export-graph FMT=gexf OUT=runs/kg_1k.gexf \
   CY="MATCH (e1:Entity)-[r:RELATES]->(e2:Entity) RETURN e1,r,e2 LIMIT 1000"
+```
+
+## 7-1) LLM 질의/세션 로깅
+`scripts/lg_pipeline.py query`에 다음 옵션이 추가되었습니다.
+
+- `--out PATH`:
+  - 질의 결과를 JSONL로 append 저장합니다(예: `runs/session.jsonl`).
+- `--explain`:
+  - 후보 Cypher, 점수, 최종 선택, 사용 모델, 재랭킹 가중치를 함께 출력합니다.
+
+예시:
+```bash
+. .env; export GEMINI_MODEL=models/gemini-2.5-pro
+.venv/bin/python scripts/lg_pipeline.py query --q "문서 5개만 보여줘" \
+  --k 5 --explain --out runs/session.jsonl
+```
+
+## 7-2) 재랭킹 가중치 튜닝
+그래프 결과와 KNN 점수를 가중합으로 결합합니다.
+
+환경변수:
+- `RERANK_GRAPH_WEIGHT` (기본 1.0)
+- `RERANK_KNN_WEIGHT`   (기본 1.0)
+
+```bash
+export RERANK_GRAPH_WEIGHT=1.0 RERANK_KNN_WEIGHT=0.5
 ```
 
 ## 8) KGE 베이스라인(선택: PyKEEN)
@@ -130,6 +171,7 @@ PY
   - `GEMINI_API_KEY` 설정 확인, 네트워크 상태 확인
 - Neo4j 연결 거부:
   - 컨테이너 기동/포트 대기 후 재시도(`7687`), 비밀번호 일치 확인
+  - 비밀번호 변경 시 컨테이너 삭제 후 재생성 필요(`docker rm -f neo4j-herb && make neo4j-up`)
 
 ## 비고
 - 키는 코드에 하드코딩하지 않고 환경변수로만 사용합니다.

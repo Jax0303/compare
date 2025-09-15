@@ -38,6 +38,9 @@ class Config:
     enable_consistency: bool = os.getenv("LG_CONSISTENCY", "0") in ("1","true","True")
     max_objects_per_sp: int = int(os.getenv("LG_MAX_OBJECTS_PER_SP", "5"))
     max_per_entity: int = int(os.getenv("LG_MAX_PER_ENTITY", "200"))
+    # Rerank weights
+    rerank_graph_weight: float = float(os.getenv("RERANK_GRAPH_WEIGHT", "1.0"))
+    rerank_knn_weight: float = float(os.getenv("RERANK_KNN_WEIGHT", "1.0"))
 
 cfg = Config()
 
@@ -122,11 +125,15 @@ def gemini_generate_json(model: str, prompt: str) -> List[Dict[str,Any]]:
 
 def text2cypher_with_gemini(question: str) -> str:
     system = (
-        "You are a Cypher assistant. Only output a single read-only Cypher query using MATCH/RETURN.\n"
+        "You are a Cypher assistant. Output ONE read-only Cypher (MATCH/RETURN only).\n"
         "Do NOT use CREATE/MERGE/SET/DELETE.\n"
-        "Schema: Nodes => (Document {id,title,text,url,embedding}), (Entity {name,type,embedding}); "
-        "Rels => (Entity)-[:RELATES {predicate,confidence}]->(Entity), (Entity)-[:APPEARS_IN]->(Document). "
-        "Avoid APPEARS_IN unless the user explicitly asks about documents; prefer RELATES patterns."
+        "Schema: Nodes: (Document {id,title,text,url,embedding}), (Entity {name,type,key,embedding}).\n"
+        "Rels: (Entity)-[:RELATES {predicate,confidence}]->(Entity), (Entity)-[:APPEARS_IN]->(Document).\n"
+        "Prefer RELATES unless the user asks about documents. Avoid literal string name equality unless unavoidable.\n"
+        "Examples:\n"
+        "- Top predicates: MATCH ()-[r:RELATES]->() RETURN r.predicate AS p, count(*) AS c ORDER BY c DESC LIMIT 5\n"
+        "- Top connected entities (by outdegree): MATCH (e:Entity)-[:RELATES]->() RETURN e.name AS name, count(*) AS deg ORDER BY deg DESC LIMIT 5\n"
+        "- Pairs by specific predicate: MATCH (e1:Entity)-[r:RELATES {predicate:$p}]->(e2:Entity) RETURN e1.name,e2.name LIMIT 10\n"
     )
     prompt = f"{system}\n\nQ: {question}\nCypher:"
     try:
@@ -210,6 +217,7 @@ class State(TypedDict, total=False):
     stats: Dict[str, Any]
     # 추출 경로
     doc_id: str
+    title: str
     text: str
     chunks: List[str]
     triples: List[Dict[str,Any]]
@@ -261,6 +269,33 @@ def ensure_schema(state: State) -> State:
     st = state.get("stats", {})
     st["schema_ok"] = True
     state["stats"] = st
+    return state
+
+def create_document(state: State) -> State:
+    """Upsert Document node with optional embedding for KNN/FTS."""
+    doc_id = state.get("doc_id") or ""
+    text = state.get("text") or ""
+    title = state.get("title") or None
+    if not doc_id or not text:
+        return state
+    # Try to create embedding for document text (truncate for speed)
+    emb: Optional[List[float]] = None
+    try:
+        sample = text[:2000]
+        # Reuse sentence-transformers path to get 384-dim vector
+        model = SentenceTransformer(os.getenv("EMBEDDING_MODEL","sentence-transformers/all-MiniLM-L6-v2"))
+        v = model.encode([sample], normalize_embeddings=True)[0]
+        emb = v.astype("float32").tolist()
+    except Exception:
+        emb = None
+    try:
+        store.upsert_document(doc_id=doc_id, text=text, title=title, embedding=emb)
+    except Exception:
+        # Best-effort; continue even if embedding upsert fails
+        try:
+            store.upsert_document(doc_id=doc_id, text=text, title=title, embedding=None)
+        except Exception:
+            pass
     return state
 
 # ---- 추출 브랜치 ----
@@ -483,12 +518,12 @@ def rerank_results(state: State) -> State:
     for r in g:
         r2 = dict(r)
         r2["_source"] = "graph"
-        r2["_score"] = 1.0
+        r2["_score"] = float(cfg.rerank_graph_weight)
         combined.append(r2)
     for r in h:
         r2 = dict(r)
         r2["_source"] = "knn"
-        r2["_score"] = float(r.get("score", 0.0))
+        r2["_score"] = float(cfg.rerank_knn_weight) * float(r.get("score", 0.0))
         combined.append(r2)
     # sort by score desc, keep top k
     combined.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
@@ -533,6 +568,7 @@ def consistency_check(state: State) -> State:
 
 g = StateGraph(State)
 g.add_node("ensure_schema", ensure_schema)
+g.add_node("create_document", create_document)
 g.add_node("redact_and_chunk", redact_and_chunk)
 g.add_node("llm_extract", llm_extract)
 g.add_node("normalize_triples", normalize_triples)
@@ -548,15 +584,17 @@ g.add_node("run_knn", run_knn)
 g.add_node("rerank_results", rerank_results)
 g.add_node("generate_answer_with_evidence", generate_answer_with_evidence)
 g.add_node("consistency_check", consistency_check)
+g.add_node("ensure_schema_q", ensure_schema)
 
 # 라우팅
 g.add_conditional_edges(START, route, {
     "extract_branch": "ensure_schema",
-    "query_branch": "t2c",
+    "query_branch": "ensure_schema_q",
 })
 
 # extract branch
-g.add_edge("ensure_schema", "redact_and_chunk")
+g.add_edge("ensure_schema", "create_document")
+g.add_edge("create_document", "redact_and_chunk")
 g.add_edge("redact_and_chunk", "llm_extract")
 g.add_edge("llm_extract", "normalize_triples")
 g.add_edge("normalize_triples", "consistency_filter")
@@ -565,6 +603,7 @@ g.add_edge("bias_mitigate", "ingest_triples")
 g.add_edge("ingest_triples", END)
 
 # query branch
+g.add_edge("ensure_schema_q", "t2c_multi")
 g.add_edge("t2c_multi", "run_cypher_multi")
 g.add_edge("run_cypher_multi", "run_knn")
 g.add_edge("run_knn", "rerank_results")
@@ -602,6 +641,8 @@ def main():
     qy = sub.add_parser("query", help="GraphRAG 질의(하이브리드)")
     qy.add_argument("--q", required=True)
     qy.add_argument("--k", type=int, default=5)
+    qy.add_argument("--out", default="", help="결과를 JSONL로 append 저장할 경로(옵션)")
+    qy.add_argument("--explain", action="store_true", help="후보 Cypher/점수와 최종 선택을 함께 출력")
 
     args = ap.parse_args()
 
@@ -642,6 +683,22 @@ def main():
             "answer": st.get("answer", ""),
             "consistent": bool(st.get("consistent", False)),
         }
+        if args.explain:
+            out["explain"] = {
+                "model": cfg.gemini_model,
+                "weights": {"graph": cfg.rerank_graph_weight, "knn": cfg.rerank_knn_weight},
+                "chosen_cypher": out.get("cypher"),
+            }
+        # optional JSONL append logging
+        if args.out:
+            try:
+                out_dir = os.path.dirname(args.out)
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                with open(args.out, "a", encoding="utf-8") as wf:
+                    wf.write(json.dumps(out, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
         print(json.dumps(out, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
