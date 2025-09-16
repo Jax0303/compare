@@ -23,6 +23,7 @@ import google.generativeai as genai
 # 임베딩 폴백
 from sentence_transformers import SentenceTransformer
 import math
+from herb_rag_kit.utils.embed_cache import get_cached_embedding, put_cached_embedding
 # ----------------------- 설정 -----------------------
 
 @dataclass
@@ -110,9 +111,14 @@ def extract_text_from_response(resp) -> str:
     return ""
 
 def gemini_generate_json(model: str, prompt: str) -> List[Dict[str,Any]]:
-    m = genai.GenerativeModel(model_name=model, generation_config={
-        "temperature": 0.0, "max_output_tokens": 2048, "response_mime_type": "application/json"
-    })
+    generation = {
+        "temperature": float(os.getenv("DECODING_TEMPERATURE", "0.0")),
+        "max_output_tokens": int(os.getenv("DECODING_MAX_TOKENS", "2048")),
+        "top_p": float(os.getenv("DECODING_TOP_P", "1.0")),
+        "top_k": int(os.getenv("DECODING_TOP_K", "0")) or None,
+        "response_mime_type": "application/json",
+    }
+    m = genai.GenerativeModel(model_name=model, generation_config={k:v for k,v in generation.items() if v is not None})
     resp = m.generate_content(prompt)
     out = extract_text_from_response(resp).strip()
     if not out:
@@ -197,11 +203,18 @@ def try_gemini_embed(q: str, dim: int) -> Optional[List[float]]:
         return None
 
 def try_st_embed(q: str, dim: int) -> Optional[List[float]]:
+    model_name = os.getenv("EMBEDDING_MODEL","sentence-transformers/all-MiniLM-L6-v2")
+    # cache lookup
+    v = get_cached_embedding(q, dim, model_name)
+    if v is not None:
+        return v
     try:
-        model = SentenceTransformer(os.getenv("EMBEDDING_MODEL","sentence-transformers/all-MiniLM-L6-v2"))
+        model = SentenceTransformer(model_name)
         v = model.encode([q], normalize_embeddings=True)[0]
         if v.shape[0] != dim: return None
-        return v.astype("float32").tolist()
+        out = v.astype("float32").tolist()
+        put_cached_embedding(q, dim, model_name, out)
+        return out
     except Exception:
         return None
 
@@ -477,10 +490,22 @@ def t2c_multi(state: State) -> State:
     cands = cypher_candidates_with_gemini(qs, num_candidates=max(3, cfg.t2c_candidates))
     # strict_graph_mode: Document 쿼리를 제거
     if cfg.strict_graph_mode:
-        cands = [c for c in cands if "(d:Document)" not in c]
+        ban_patterns = ["(d:Document)", ":APPEARS_IN", "Document)", "(Document ", "MATCH (d:document)"]
+        def bad(c: str) -> bool:
+            lc = c.lower()
+            return any(p.lower() in lc for p in ban_patterns)
+        cands = [c for c in cands if not bad(c)]
     state["cypher_candidates"] = cands
     # keep first as default
-    state["cypher"] = cands[0] if cands else text2cypher_with_gemini(qs)
+    if cands:
+        state["cypher"] = cands[0]
+    else:
+        # strict fallback: 강제 RELATES 템플릿
+        state["cypher"] = (
+            "MATCH ()-[r:RELATES]->() RETURN r.predicate AS p, count(*) AS c ORDER BY c DESC LIMIT 5"
+            if "predicate" in qs or "상위" in qs or "관계" in qs else
+            "MATCH (e:Entity)-[:RELATES]->() RETURN e.name AS name, count(*) AS deg ORDER BY deg DESC LIMIT 5"
+        )
     return state
 
 def run_cypher_multi(state: State) -> State:
