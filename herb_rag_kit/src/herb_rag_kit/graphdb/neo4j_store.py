@@ -118,6 +118,24 @@ class Neo4jStore:
         """
         return self.run_cypher(cy, {"k": k, "q": qvec})
 
+    # --------- PPR / PageRank utils (optional) ---------
+    def ppr(self, source_name: str, k: int = 10) -> List[Dict[str, Any]]:
+        cy = """
+        MATCH (s:Entity {name:$name})
+        CALL gds.pageRank.stream({
+          nodeProjection: 'Entity',
+          relationshipProjection: {RELATES: {type: 'RELATES', orientation: 'NATURAL'}},
+          maxIterations: 20, dampingFactor: 0.85, sourceNodes: [s]
+        }) YIELD nodeId, score
+        WITH gds.util.asNode(nodeId) AS n, score
+        RETURN n.name AS name, score
+        ORDER BY score DESC LIMIT $k
+        """
+        try:
+            return self.run_cypher(cy, {"name": source_name, "k": k})
+        except Exception:
+            return []
+
     # ---------- stats ----------
     def graph_size(self) -> Dict[str,int]:
         q = [

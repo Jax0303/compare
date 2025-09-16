@@ -41,6 +41,9 @@ class Config:
     # Rerank weights
     rerank_graph_weight: float = float(os.getenv("RERANK_GRAPH_WEIGHT", "1.0"))
     rerank_knn_weight: float = float(os.getenv("RERANK_KNN_WEIGHT", "1.0"))
+    # Query behavior
+    strict_graph_mode: bool = os.getenv("STRICT_GRAPH_MODE", "0") in ("1","true","True")
+    t2c_candidates: int = int(os.getenv("T2C_NUM_CANDIDATES", "5"))
 
 cfg = Config()
 
@@ -471,7 +474,10 @@ def run_cypher(state: State) -> State:
 
 def t2c_multi(state: State) -> State:
     qs = state["question"]
-    cands = cypher_candidates_with_gemini(qs, num_candidates=3)
+    cands = cypher_candidates_with_gemini(qs, num_candidates=max(3, cfg.t2c_candidates))
+    # strict_graph_mode: Document 쿼리를 제거
+    if cfg.strict_graph_mode:
+        cands = [c for c in cands if "(d:Document)" not in c]
     state["cypher_candidates"] = cands
     # keep first as default
     state["cypher"] = cands[0] if cands else text2cypher_with_gemini(qs)
@@ -525,9 +531,20 @@ def rerank_results(state: State) -> State:
         r2["_source"] = "knn"
         r2["_score"] = float(cfg.rerank_knn_weight) * float(r.get("score", 0.0))
         combined.append(r2)
-    # sort by score desc, keep top k
-    combined.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
-    state["reranked_rows"] = combined[: int(state.get("k", 5))]
+    # MMR 다양성(간단 버전): 이미 선택된 것과 동일 name/predicate 반복에 패널티
+    k = int(state.get("k", 5))
+    selected: List[Dict[str,Any]] = []
+    seen_keys = set()
+    for item in sorted(combined, key=lambda x: x.get("_score", 0.0), reverse=True):
+        key = (item.get("name"), item.get("p") or item.get("predicate"))
+        if key in seen_keys and len(selected) < k:
+            item["_score"] *= 0.8
+        if len(selected) < k:
+            selected.append(item)
+            seen_keys.add(key)
+        if len(selected) >= k:
+            break
+    state["reranked_rows"] = selected
     return state
 
 def generate_answer_with_evidence(state: State) -> State:
@@ -585,6 +602,20 @@ g.add_node("rerank_results", rerank_results)
 g.add_node("generate_answer_with_evidence", generate_answer_with_evidence)
 g.add_node("consistency_check", consistency_check)
 g.add_node("ensure_schema_q", ensure_schema)
+def run_paths(state: State) -> State:
+    # 간단 경로 탐색: 상위 엔티티 두 개를 기준으로 1..3홉 경로 예시
+    try:
+        rows = store.run_cypher(
+            """
+            MATCH (e1:Entity)-[:RELATES*1..3]->(e2:Entity)
+            RETURN e1.name AS s, e2.name AS o, 1 AS hop
+            LIMIT 50
+            """
+        )
+    except Exception:
+        rows = []
+    state["graph_rows"] = rows
+    return state
 
 # 라우팅
 g.add_conditional_edges(START, route, {
