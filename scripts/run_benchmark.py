@@ -57,6 +57,9 @@ def main() -> None:
             rec['rows'] = len(res['stdout'].get('graph_rows', [])) + len(res['stdout'].get('hybrid_rows', []))
             rec['cypher'] = res['stdout'].get('cypher')
             rec['consistent'] = res['stdout'].get('consistent')
+            rec['confidence'] = res['stdout'].get('confidence')
+            rec['entities'] = len(res['stdout'].get('entities', []))
+            rec['paths'] = len(res['stdout'].get('paths', []))
         with open(args.log, 'a', encoding='utf-8') as wf:
             wf.write(json.dumps(rec, ensure_ascii=False) + '\n')
         all_rows.append(rec)

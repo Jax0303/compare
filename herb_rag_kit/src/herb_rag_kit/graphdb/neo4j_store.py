@@ -40,7 +40,9 @@ class Neo4jStore:
             OPTIONS { indexConfig: { `vector.dimensions`: $dim, `vector.similarity_function`: 'cosine' } }
             """,
             # Full-text index (5.x 권장 구문)
-            "CREATE FULLTEXT INDEX idx_doc_fulltext IF NOT EXISTS FOR (n:Document) ON EACH [n.title, n.text]"
+            "CREATE FULLTEXT INDEX idx_doc_fulltext IF NOT EXISTS FOR (n:Document) ON EACH [n.title, n.text]",
+            # Entity name/type full-text
+            "CREATE FULLTEXT INDEX idx_entity_fulltext IF NOT EXISTS FOR (e:Entity) ON EACH [e.name, e.type]"
         ]
         with self.driver.session(database=self.cfg.database) as s:
             for st in statements:
@@ -106,6 +108,15 @@ class Neo4jStore:
         CALL db.index.fulltext.queryNodes('idx_doc_fulltext', $q)
         YIELD node, score
         RETURN node.id AS id, node.title AS title, score
+        LIMIT $k
+        """
+        return self.run_cypher(cy, {"q": query, "k": k})
+
+    def entity_fulltext(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        cy = """
+        CALL db.index.fulltext.queryNodes('idx_entity_fulltext', $q)
+        YIELD node, score
+        RETURN node.name AS name, node.type AS type, node.key AS key, score
         LIMIT $k
         """
         return self.run_cypher(cy, {"q": query, "k": k})

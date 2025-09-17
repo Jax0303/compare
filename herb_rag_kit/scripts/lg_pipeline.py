@@ -24,6 +24,9 @@ import google.generativeai as genai
 from sentence_transformers import SentenceTransformer
 import math
 from herb_rag_kit.utils.embed_cache import get_cached_embedding, put_cached_embedding
+from herb_rag_kit.graphdb.neo4j_store import Neo4jStore
+from herb_rag_kit.graphdb.schema_stats import load_schema_stats
+from herb_rag_kit.retrieval.path_reranker import rerank_with_lgbm
 # ----------------------- 설정 -----------------------
 
 @dataclass
@@ -42,9 +45,14 @@ class Config:
     # Rerank weights
     rerank_graph_weight: float = float(os.getenv("RERANK_GRAPH_WEIGHT", "1.0"))
     rerank_knn_weight: float = float(os.getenv("RERANK_KNN_WEIGHT", "1.0"))
+    rerank_path_weight: float = float(os.getenv("RERANK_PATH_WEIGHT", "1.0"))
+    path_reranker_model: str = os.getenv("PATH_RERANKER_MODEL", "")
+    schema_path: str = os.getenv("SCHEMA_JSON", "runs/fb15k237_schema.json")
     # Query behavior
     strict_graph_mode: bool = os.getenv("STRICT_GRAPH_MODE", "0") in ("1","true","True")
     t2c_candidates: int = int(os.getenv("T2C_NUM_CANDIDATES", "5"))
+    entity_fulltext_k: int = int(os.getenv("ENTITY_FT_K", "5"))
+    abstain_threshold: float = float(os.getenv("ABSTAIN_THRESHOLD", "0.25"))
 
 cfg = Config()
 
@@ -245,10 +253,13 @@ class State(TypedDict, total=False):
     candidate_scores: List[float]
     graph_rows: List[Dict[str,Any]]
     hybrid_rows: List[Dict[str,Any]]
+    entities: List[Dict[str,Any]]
+    paths: List[Dict[str,Any]]
     k: int
     reranked_rows: List[Dict[str,Any]]
     answer: str
     consistent: bool
+    confidence: float
 
 store = Neo4jStore()
 
@@ -527,7 +538,79 @@ def run_cypher_multi(state: State) -> State:
     state["candidate_scores"] = scores
     if cands:
         state["cypher"] = cands[best_idx]
-    state["graph_rows"] = best_rows
+    # Fallback: if no rows, use simple path-based evidence to keep pipeline informative
+    if not best_rows:
+        try:
+            fallback = store.run_cypher(
+                """
+                MATCH (e1:Entity)-[r:RELATES]->(e2:Entity)
+                RETURN e1 AS e1, r AS r, e2 AS e2
+                LIMIT 50
+                """
+            )
+        except Exception:
+            fallback = []
+        state["graph_rows"] = fallback
+    else:
+        state["graph_rows"] = best_rows
+    return state
+
+# --- Agentic additions: entity linking, path finding, abstention ---
+def entity_linker(state: State) -> State:
+    """Fulltext search over Entity by the question string."""
+    try:
+        ents = store.entity_fulltext(state.get("question", ""), k=max(3, cfg.entity_fulltext_k))
+    except Exception:
+        ents = []
+    state["entities"] = ents
+    return state
+
+def path_finder(state: State) -> State:
+    """Find short paths between top entities (1..3 hops)."""
+    ents = state.get("entities", [])
+    names = [e.get("name") for e in ents if e.get("name")][:3]
+    paths: List[Dict[str,Any]] = []
+    if len(names) >= 2:
+        try:
+            cy = (
+                "MATCH (a:Entity{name:$s}), (b:Entity{name:$t}) "
+                "CALL gds.shortestPath.dijkstra.stream({sourceNode:a, targetNode:b, "
+                "nodeProjection:'Entity', relationshipProjection:{RELATES:{type:'RELATES', orientation:'NATURAL'}}}) "
+                "YIELD totalCost RETURN $s AS s, $t AS t, totalCost AS cost LIMIT 1"
+            )
+            for i in range(len(names)):
+                for j in range(i+1, len(names)):
+                    rows = store.run_cypher(cy, {"s": names[i], "t": names[j]})
+                    for r in rows:
+                        paths.append({"s": r.get("s"), "t": r.get("t"), "cost": float(r.get("cost", 0.0))})
+        except Exception:
+            # Fallback: simple path existence by BFS up to 3 hops
+            try:
+                cy2 = (
+                    "MATCH (a:Entity{name:$s})-[:RELATES*1..3]->(b:Entity{name:$t}) "
+                    "RETURN $s AS s, $t AS t, 1.0 AS cost LIMIT 1"
+                )
+                for i in range(len(names)):
+                    for j in range(i+1, len(names)):
+                        rows = store.run_cypher(cy2, {"s": names[i], "t": names[j]})
+                        if rows:
+                            paths.append({"s": names[i], "t": names[j], "cost": 1.0})
+            except Exception:
+                pass
+    state["paths"] = paths
+    return state
+
+def abstention(state: State) -> State:
+    """Compute simple confidence and abstain if too low by setting answer."""
+    # heuristic: confidence from candidate_scores and reranked_rows size
+    cand_scores = state.get("candidate_scores") or []
+    rer = state.get("reranked_rows") or []
+    base = max(cand_scores) / (max(1.0, sum(cand_scores))) if cand_scores else 0.0
+    bonus = min(1.0, len(rer) / max(1, int(state.get("k", 5))))
+    conf = 0.5 * base + 0.5 * bonus
+    state["confidence"] = conf
+    if conf < cfg.abstain_threshold and not state.get("answer"):
+        state["answer"] = "insufficient evidence"
     return state
 
 def run_knn(state: State) -> State:
@@ -541,7 +624,7 @@ def run_knn(state: State) -> State:
     return state
 
 def rerank_results(state: State) -> State:
-    """Heuristic re-ranker combining graph_rows and hybrid_rows."""
+    """Re-ranker combining graph_rows and hybrid_rows with optional LGBM model."""
     g = state.get("graph_rows", [])
     h = state.get("hybrid_rows", [])
     combined: List[Dict[str,Any]] = []
@@ -556,11 +639,29 @@ def rerank_results(state: State) -> State:
         r2["_source"] = "knn"
         r2["_score"] = float(cfg.rerank_knn_weight) * float(r.get("score", 0.0))
         combined.append(r2)
+    # path evidence bonus: if an item mentions s/o in paths, boost
+    paths = state.get("paths", [])
+    path_pairs = {(p.get("s"), p.get("t")) for p in paths}
+    def has_pair(item: Dict[str,Any]) -> bool:
+        s = item.get("s") or item.get("e1") or item.get("name")
+        o = item.get("o") or item.get("e2")
+        if s and o and (s, o) in path_pairs:
+            return True
+        return False
+    for it in combined:
+        if has_pair(it):
+            it["_score"] = it.get("_score", 0.0) + float(cfg.rerank_path_weight)
+    # 학습형 재랭커가 있으면 적용
+    schema = load_schema_stats(cfg.schema_path)
+    try:
+        reranked = rerank_with_lgbm(combined, schema, paths, cfg.path_reranker_model or None)
+    except Exception:
+        reranked = combined
     # MMR 다양성(간단 버전): 이미 선택된 것과 동일 name/predicate 반복에 패널티
     k = int(state.get("k", 5))
     selected: List[Dict[str,Any]] = []
     seen_keys = set()
-    for item in sorted(combined, key=lambda x: x.get("_score", 0.0), reverse=True):
+    for item in sorted(reranked, key=lambda x: x.get("_lgbm", x.get("_score", 0.0)), reverse=True):
         key = (item.get("name"), item.get("p") or item.get("predicate"))
         if key in seen_keys and len(selected) < k:
             item["_score"] *= 0.8
@@ -627,6 +728,9 @@ g.add_node("rerank_results", rerank_results)
 g.add_node("generate_answer_with_evidence", generate_answer_with_evidence)
 g.add_node("consistency_check", consistency_check)
 g.add_node("ensure_schema_q", ensure_schema)
+g.add_node("entity_linker", entity_linker)
+g.add_node("path_finder", path_finder)
+g.add_node("abstention", abstention)
 def run_paths(state: State) -> State:
     # 간단 경로 탐색: 상위 엔티티 두 개를 기준으로 1..3홉 경로 예시
     try:
@@ -662,10 +766,13 @@ g.add_edge("ingest_triples", END)
 g.add_edge("ensure_schema_q", "t2c_multi")
 g.add_edge("t2c_multi", "run_cypher_multi")
 g.add_edge("run_cypher_multi", "run_knn")
-g.add_edge("run_knn", "rerank_results")
+g.add_edge("run_knn", "entity_linker")
+g.add_edge("entity_linker", "path_finder")
+g.add_edge("path_finder", "rerank_results")
 g.add_edge("rerank_results", "generate_answer_with_evidence")
 g.add_edge("generate_answer_with_evidence", "consistency_check")
-g.add_edge("consistency_check", END)
+g.add_edge("consistency_check", "abstention")
+g.add_edge("abstention", END)
 
 app = g.compile()
 
@@ -735,9 +842,12 @@ def main():
             "candidate_scores": st.get("candidate_scores", []),
             "graph_rows": st.get("graph_rows", [])[:args.k],
             "hybrid_rows": st.get("hybrid_rows", []),
+            "entities": st.get("entities", []),
+            "paths": st.get("paths", []),
             "reranked_rows": st.get("reranked_rows", []),
             "answer": st.get("answer", ""),
             "consistent": bool(st.get("consistent", False)),
+            "confidence": float(st.get("confidence", 0.0)),
         }
         if args.explain:
             out["explain"] = {

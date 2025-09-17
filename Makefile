@@ -66,7 +66,8 @@ extract: | venv
 freebase-load: | venv
 	@if [ -z "$(FILE)" ]; then echo "Usage: make freebase-load FILE=path [LIMIT=0 CLEAR=1]"; exit 1; fi
 	@if [ "$(CLEAR)" = "1" ]; then CLEAR_FLAG=--clear-db; else CLEAR_FLAG=; fi; \
-	$(PYW) herb_rag_kit/scripts/freebase_loader.py --input "$(FILE)" --limit ${LIMIT-0} $$CLEAR_FLAG
+	: $${LIMIT:=0}; \
+	$(PYW) herb_rag_kit/scripts/freebase_loader.py --input "$(FILE)" --limit $$LIMIT $$CLEAR_FLAG
 
 eval: | venv
 	$(PYW) herb_rag_kit/scripts/kg_quality_eval.py
